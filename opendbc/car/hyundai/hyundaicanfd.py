@@ -244,6 +244,157 @@ def create_adrv_messages(packer, CAN, frame):
   return ret
 
 
+def hyundai_crc8(data: bytes) -> int:
+  poly = 0x2F
+  crc = 0xFF
+  for byte in data:
+    crc ^= byte
+    for _ in range(8):
+      crc = ((crc << 1) ^ poly) & 0xFF if crc & 0x80 else (crc << 1) & 0xFF
+  return crc ^ 0xFF
+
+
+def create_steering_messages_adrv(packer, CP, CAN, lat_active, apply_torque, CS, frame):
+  ret = []
+
+  # Spoof MDPS to CAM bus — camera needs to see steering state
+  if CS.mdps_info:
+    values = copy.copy(CS.mdps_info)
+    if frame % 1000 < 40:
+      values["STEERING_COL_TORQUE"] = values.get("STEERING_COL_TORQUE", 0) + 220
+    ret.append(packer.make_can_msg("MDPS", CAN.CAM, values))
+
+  # LFA steering command to ECAN
+  values = {
+    "LKA_MODE": 2,
+    "LKA_ICON": 2 if lat_active else 1,
+    "TORQUE_REQUEST": apply_torque,
+    "STEER_REQ": 1 if lat_active else 0,
+    "HAS_LANE_SAFETY": 0,
+    "DAMP_FACTOR": 0 if lat_active else 100,
+  }
+  ret.append(packer.make_can_msg("LFA", CAN.ECAN, values))
+
+  return ret
+
+
+def create_acc_control_scc_adrv(packer, CAN, enabled, accel_last, accel, stopping, gas_override, set_speed, hud_control,
+                                jerk_u, jerk_l, CS):
+  jerk = 5
+  jn = jerk / 50
+  if not enabled or gas_override:
+    a_val, a_raw = 0, 0
+  else:
+    a_raw = accel
+    a_val = np.clip(accel, accel_last - jn, accel_last + jn)
+
+  values = copy.copy(CS.cruise_info)
+  values["ACCMode"] = 0 if not enabled else (2 if gas_override else 1)
+  values["MainMode_ACC"] = 1
+  values["StopReq"] = 1 if stopping else 0
+  values["aReqValue"] = a_val
+  values["aReqRaw"] = a_raw
+  values["VSetDis"] = set_speed
+  values["JerkLowerLimit"] = jerk_l if enabled else 1
+  values["JerkUpperLimit"] = 2.0 if stopping else jerk_u
+  values["DISTANCE_SETTING"] = hud_control.leadDistanceBars
+
+  return packer.make_can_msg("SCC_CONTROL", CAN.ECAN, values)
+
+
+def create_tcs_messages_adrv(packer, CAN, CS):
+  ret = []
+  if CS.tcs_info is not None:
+    values = copy.copy(CS.tcs_info)
+    values["DriverBraking"] = 0
+    values["DriverBrakingLowSens"] = 0
+    values["NEW_SIGNAL_1"] = 0 if values.get("ACC_REQ") == 1 else 1
+    ret.append(packer.make_can_msg("TCS", CAN.ECAN, values))
+  return ret
+
+
+def create_ccnc_messages_adrv(packer, CAN, frame, CC, CS, hud_control):
+  from opendbc.car.common.conversions import Conversions as CV
+  ret = []
+
+  # ADRV_0x160: Clear LFA fault (every 2 frames)
+  if frame % 2 == 0:
+    values = {}
+    if CS.adrv_160_info is not None:
+      values = copy.copy(CS.adrv_160_info)
+    values["AEB_SETTING"] = 0x1
+    values["SET_ME_2"] = 0x2
+    values["SET_ME_FF"] = 0xff
+    values["SET_ME_FC"] = 0xfc
+    values["SET_ME_9"] = 0x9
+    ret.append(packer.make_can_msg("ADRV_0x160", CAN.ECAN, values))
+
+    # Button engagement: auto-engage ACC/LFA when openpilot enables
+    if CS.cruise_buttons_msg is not None:
+      values = copy.copy(CS.cruise_buttons_msg)
+      # Auto-press LDA button to engage LFA if not active
+      if CS.LFA_ICON == 0 and 0 < frame % 200 < 12:
+        values["LDA_BTN"] = 1
+      # Auto-engage ACC if main is on but ACC not active
+      if CC.enabled and CS.MainMode_ACC:
+        if CS.ACCMode in (0, 4) and 10 < frame % 200 < 22:
+          values["CRUISE_BUTTONS"] = 2  # SET_DECEL to engage
+      elif CC.enabled and not CS.MainMode_ACC and 10 < frame % 200 <= 16:
+        values["ADAPTIVE_CRUISE_MAIN_BTN"] = 1
+      ret.append(packer.make_can_msg(CS.cruise_btns_msg_canfd, CAN.ECAN, values))
+
+  # CCNC_0x161: HUD cluster (every 5 frames) — construct from scratch
+  if frame % 5 == 0:
+    main_enabled = getattr(getattr(CS, 'out', None), 'cruiseState', None)
+    main_enabled = main_enabled.available if main_enabled else False
+    cruise_enabled = CC.enabled
+    lat_active = CC.latActive
+
+    set_speed_in_units = hud_control.setSpeed * (CV.MS_TO_KPH if CS.is_metric else CV.MS_TO_MPH)
+
+    values = {
+      "SETSPEED": (3 if cruise_enabled else 1) if main_enabled else 0,
+      "SETSPEED_HUD": (3 if cruise_enabled else 1) if main_enabled else 0,
+      "SETSPEED_SPEED": int(set_speed_in_units + 0.5),
+      "DISTANCE": hud_control.leadDistanceBars,
+      "DISTANCE_LEAD": 2 if cruise_enabled and hud_control.leadVisible else 1 if main_enabled and hud_control.leadVisible else 0,
+      "DISTANCE_CAR": 2 if cruise_enabled else 1 if main_enabled else 0,
+      "HDA_ICON": 2 if cruise_enabled else 1 if main_enabled else 0,
+      "LFA_ICON": 2 if lat_active else 1 if main_enabled else 0,
+      "LANELINE_LEFT": 2 if hud_control.leftLaneVisible else 0,
+      "LANELINE_RIGHT": 2 if hud_control.rightLaneVisible else 0,
+    }
+    ret.append(packer.make_can_msg("CCNC_0x161", CAN.ECAN, values))
+
+    # CCNC_0x162: Lead vehicle tracking — construct from scratch
+    values = {}
+    ret.append(packer.make_can_msg("CCNC_0x162", CAN.ECAN, values))
+
+    # ADRV_0x1ea: Side detection passthrough or defaults
+    if CS.adrv_1ea_info is not None:
+      values = copy.copy(CS.adrv_1ea_info)
+    else:
+      values = {
+        "SET_ME_1C": 0x1c,
+        "SET_ME_FF": 0xff,
+        "SET_ME_TMP_F": 0xf,
+        "SET_ME_TMP_F_2": 0xf,
+      }
+    ret.append(packer.make_can_msg("ADRV_0x1ea", CAN.ECAN, values))
+
+    # ADRV_0x200: Cruise params
+    if CS.adrv_200_info is not None:
+      values = copy.copy(CS.adrv_200_info)
+    else:
+      values = {
+        "SET_ME_E1": 0xe1,
+        "SET_ME_3A": 0x3a,
+      }
+    ret.append(packer.make_can_msg("ADRV_0x200", CAN.ECAN, values))
+
+  return ret
+
+
 def hkg_can_fd_checksum(address: int, sig, d: bytearray) -> int:
   crc = 0
   for i in range(2, len(d)):
