@@ -68,6 +68,7 @@ class HyundaiSafetyFlags(IntFlag):
   CANFD_LKA_STEERING_ALT = 128
   FCEV_GAS = 256
   ALT_LIMITS_2 = 512
+  CANFD_ADRV_CONTROL = 1024
 
 
 class HyundaiFlags(IntFlag):
@@ -608,6 +609,11 @@ class CAR(Platforms):
     [HyundaiCarDocs("Genesis GV80 2023", "All", car_parts=CarParts.common([CarHarness.hyundai_m]))],
     CarSpecs(mass=2258, wheelbase=2.95, steerRatio=14.14),
     flags=HyundaiFlags.RADAR_SCC,
+  )
+  GENESIS_GV80_2021 = HyundaiCanFDPlatformConfig(
+    [HyundaiCarDocs("Genesis GV80 2021", "All", car_parts=CarParts.common([CarHarness.hyundai_q]))],
+    CarSpecs(mass=2258, wheelbase=2.95, steerRatio=14.14),
+    flags=HyundaiFlags.MANDO_RADAR | HyundaiFlags.ENABLE_BLINKERS,
   )
 
   # port extensions
