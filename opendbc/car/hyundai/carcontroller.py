@@ -48,6 +48,28 @@ def process_hud_alert(enabled, fingerprint, hud_control):
   return sys_warning, sys_state, left_lane_warning, right_lane_warning
 
 
+class HyundaiJerk:
+  def __init__(self):
+    self.jerk_u = 0.5
+    self.jerk_l = 1.0
+
+  def make_jerk(self, CP, CS, accel, actuators):
+    jerk_max = 5.0
+    if actuators.longControlState == LongCtrlState.stopping:
+      jerk = 0.25 - getattr(CS.out, 'aEgo', 0)
+    elif actuators.longControlState == LongCtrlState.pid:
+      jerk = getattr(actuators, 'jerk', 0.0)
+    else:
+      jerk = 0.0
+
+    if actuators.longControlState == LongCtrlState.off:
+      self.jerk_u = jerk_max
+      self.jerk_l = jerk_max
+    elif CP.flags & HyundaiFlags.CANFD:
+      self.jerk_u = min(max(0.5, jerk * 2.0), jerk_max)
+      self.jerk_l = min(max(1.0, -jerk * 4.0), jerk_max)
+
+
 class CarController(CarControllerBase, EsccCarController, LeadDataCarController, LongitudinalController, MadsCarController,
                     IntelligentCruiseButtonManagementInterface):
   def __init__(self, dbc_names, CP, CP_SP):
@@ -66,6 +88,15 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     self.apply_torque_last = 0
     self.car_fingerprint = CP.carFingerprint
     self.last_button_frame = 0
+
+    # ADRV control state
+    self.adrv_control = bool(CP.safetyConfigs[-1].safetyParam & 1024)  # CANFD_ADRV_CONTROL
+    self.hyundai_jerk = HyundaiJerk()
+    # Cut-in detection
+    self.cut_in_run_timer = 0
+    self.prev_lead_distance = 0
+    # Resume from stop
+    self.standstill_status = False
 
   def update(self, CC, CC_SP, CS, now_nanos):
     EsccCarController.update(self, CS)
@@ -105,7 +136,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     # *** common hyundai stuff ***
 
     # tester present - w/ no response (keeps relevant ECU disabled)
-    if self.frame % 100 == 0 and not ((self.CP.flags & HyundaiFlags.CANFD_CAMERA_SCC) or self.ESCC.enabled) and \
+    if self.frame % 100 == 0 and not ((self.CP.flags & HyundaiFlags.CANFD_CAMERA_SCC) or self.ESCC.enabled or self.adrv_control) and \
             self.CP.openpilotLongitudinalControl:
       # for longitudinal control, either radar or ADAS driving ECU
       addr, bus = 0x7d0, self.CAN.ECAN if self.CP.flags & HyundaiFlags.CANFD else 0
@@ -189,6 +220,68 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
 
     lka_steering = self.CP.flags & HyundaiFlags.CANFD_LKA_STEERING
     lka_steering_long = lka_steering and self.CP.openpilotLongitudinalControl
+
+    if self.adrv_control:
+      # === ADRV control path ===
+      # Intercept and modify ADAS messages instead of disabling ECU
+
+      # Steering via ADRV path
+      can_sends.extend(hyundaicanfd.create_steering_messages_adrv(
+        self.packer, self.CP, self.CAN, CC.latActive, apply_torque, CS, self.frame))
+
+      # HUD cluster, button engagement, ADRV messages
+      can_sends.extend(hyundaicanfd.create_ccnc_messages_adrv(
+        self.packer, self.CAN, self.frame, CC, CS, hud_control))
+
+      # Jerk computation
+      self.hyundai_jerk.make_jerk(self.CP, CS, accel, CC.actuators)
+
+      # Cut-in detection: reduce jerk during rapid lead vehicle changes
+      if hasattr(self, 'lead_data') and self.lead_data.lead_visible:
+        lead_dist = self.lead_data.lead_distance
+        lead_vrel = self.lead_data.lead_rel_speed
+        if self.prev_lead_distance > 0 and lead_dist < self.prev_lead_distance - 1.0 and lead_vrel < -1.0:
+          self.cut_in_run_timer = 100  # ~1 second at 100Hz
+        self.prev_lead_distance = lead_dist
+      else:
+        self.prev_lead_distance = 0
+
+      if self.cut_in_run_timer > 0:
+        self.cut_in_run_timer -= 1
+        self.hyundai_jerk.jerk_u = min(self.hyundai_jerk.jerk_u, 1.0)
+
+      # Longitudinal control (every 2 frames)
+      if self.frame % 2 == 0:
+        can_sends.append(hyundaicanfd.create_acc_control_scc_adrv(
+          self.packer, self.CAN, CC.enabled, self.accel_last, accel, stopping,
+          CC.cruiseControl.override, set_speed_in_units, hud_control,
+          self.hyundai_jerk.jerk_u, self.hyundai_jerk.jerk_l, CS))
+        can_sends.extend(hyundaicanfd.create_tcs_messages_adrv(self.packer, self.CAN, CS))
+        self.accel_last = accel
+
+      # Resume from stop: auto-press resume when lead pulls away
+      if hasattr(CS, 'out') and CS.out.cruiseState.standstill and CS.out.vEgo <= 0.3:
+        if hasattr(self, 'lead_data') and self.lead_data.lead_distance > 0:
+          if not self.standstill_status or self.prev_lead_distance > self.lead_data.lead_distance:
+            self.standstill_status = True
+          elif self.standstill_status and self.lead_data.lead_distance - self.prev_lead_distance >= 0.1:
+            # Lead pulled away — resume handled by button engagement in create_ccnc_messages_adrv
+            pass
+      else:
+        self.standstill_status = False
+
+      # Blinkers
+      if self.CP.flags & HyundaiFlags.ENABLE_BLINKERS:
+        can_sends.extend(hyundaicanfd.create_spas_messages(self.packer, self.CAN, CC.leftBlinker, CC.rightBlinker))
+
+      # LFA suppress on LKA steering (same as non-ADRV LKA path)
+      if self.frame % 5 == 0 and lka_steering:
+        can_sends.append(hyundaicanfd.create_suppress_lfa(self.packer, self.CAN, CS.lfa_block_msg,
+                                                          self.CP.flags & HyundaiFlags.CANFD_LKA_STEERING_ALT))
+
+      return can_sends
+
+    # === Standard (non-ADRV) path below — UNCHANGED ===
 
     # steering control
     can_sends.extend(hyundaicanfd.create_steering_messages(self.packer, self.CP, self.CAN, CC.enabled, apply_steer_req, apply_torque, self.lkas_icon))
