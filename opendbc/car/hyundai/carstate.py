@@ -65,6 +65,19 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
 
     self.cruise_info = {}
 
+    # ADRV control state
+    self.adrv_160_info = None
+    self.adrv_1ea_info = None
+    self.adrv_200_info = None
+    self.mdps_info = {}
+    self.tcs_info = None
+    self.lfa_info = None
+    self.lfahda_cluster_info = None
+    self.cruise_buttons_msg = None
+    self.MainMode_ACC = False
+    self.ACCMode = 0
+    self.LFA_ICON = 0
+
     # On some cars, CLU15->CF_Clu_VehicleSpeed can oscillate faster than the dash updates. Sample at 5 Hz
     self.cluster_speed = 0
     self.cluster_speed_counter = CLUSTER_SAMPLE_RATE
@@ -225,6 +238,8 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
     ret = structs.CarState()
     ret_sp = structs.CarStateSP()
 
+    adrv_control = bool(self.CP.safetyConfigs[-1].safetyParam & 1024)  # CANFD_ADRV_CONTROL
+
     self.is_metric = cp.vl["CRUISE_BUTTONS_ALT"]["DISTANCE_UNIT"] != 1
     speed_factor = CV.KPH_TO_MS if self.is_metric else CV.MPH_TO_MS
 
@@ -282,6 +297,26 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
       ret.cruiseState.speed = cp_cruise_info.vl["SCC_CONTROL"]["VSetDis"] * speed_factor
       self.cruise_info = copy.copy(cp_cruise_info.vl["SCC_CONTROL"])
 
+    if adrv_control:
+      # ADRV control: messages on ECAN (bus 1)
+      self.cruise_info = copy.copy(cp.vl["SCC_CONTROL"])
+      self.MainMode_ACC = cp.vl["SCC_CONTROL"]["MainMode_ACC"] == 1
+      self.ACCMode = cp.vl["SCC_CONTROL"]["ACCMode"]
+      self.lfa_info = copy.copy(cp.vl["LFA"])
+      self.lfahda_cluster_info = copy.copy(cp.vl["LFAHDA_CLUSTER"])
+      self.LFA_ICON = self.lfahda_cluster_info.get("HDA_LFA_SymSta", 0)
+      self.adrv_160_info = copy.copy(cp.vl["ADRV_0x160"])
+      self.adrv_1ea_info = copy.copy(cp.vl["ADRV_0x1ea"])
+      self.adrv_200_info = copy.copy(cp.vl["ADRV_0x200"])
+      self.mdps_info = copy.copy(cp.vl["MDPS"])
+      self.tcs_info = copy.copy(cp.vl["TCS"])
+      self.cruise_buttons_msg = copy.copy(cp.vl[self.cruise_btns_msg_canfd])
+
+      # Override cruise state for ADRV path
+      ret.cruiseState.enabled = self.ACCMode in (1, 2)
+      ret.cruiseState.standstill = cp.vl["SCC_CONTROL"]["CRUISE_STANDSTILL"] == 1
+      ret.cruiseState.speed = cp.vl["SCC_CONTROL"]["VSetDis"] * speed_factor
+
     # Manual Speed Limit Assist is a feature that replaces non-adaptive cruise control on EV CAN FD platforms.
     # It limits the vehicle speed, overridable by pressing the accelerator past a certain point.
     # The car will brake, but does not respect positive acceleration commands in this mode
@@ -325,6 +360,19 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
         # this message is 50Hz but the ECU frequently stops transmitting for ~0.5s
         ("CRUISE_BUTTONS", 1)
       ]
+
+    # ADRV control: additional messages on ECAN
+    adrv_control = bool(CP.safetyConfigs[-1].safetyParam & 1024)
+    if adrv_control:
+      msgs += [
+        ("SCC_CONTROL", 50),
+        ("LFA", 100),
+        ("LFAHDA_CLUSTER", 20),
+        ("ADRV_0x160", 50),
+        ("ADRV_0x1ea", 20),
+        ("ADRV_0x200", 20),
+      ]
+
     return {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], msgs, CanBus(CP).ECAN),
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CanBus(CP).CAM),
