@@ -265,7 +265,7 @@ static safety_config hyundai_canfd_init(uint16_t param) {
     {0x1DA, 1, 32, .check_relay = false},  // ADRV_0x1da
     {0x175, 1, 24, .check_relay = false},  // TCS (brake state)
     {0xEA,  2, 24, .check_relay = false},  // MDPS to CAM
-    {0x1CF, 2,  8, .check_relay = false},  // CRUISE_BUTTONS to CAM
+    {0x1CF, 1,  8, .check_relay = false},  // CRUISE_BUTTONS to ECAN
   };
 
   static const CanMsg HYUNDAI_CANFD_LFA_STEERING_TX_MSGS[] = {
