@@ -255,6 +255,15 @@ class CarInterface(CarInterfaceBase):
     if CP.flags & HyundaiFlags.ENABLE_BLINKERS:
       disable_ecu(can_recv, can_send, bus=CanBus(CP).ECAN, addr=0x7B1, com_cont_req=communication_control)
 
+    # Radar track enabling
+    try:
+      from openpilot.common.params import Params
+      if Params().get_int("HyundaiRadar") > 0:
+        from opendbc.sunnypilot.car.hyundai.enable_radar_tracks import enable_radar_tracks
+        enable_radar_tracks(can_recv, can_send)
+    except Exception:
+      pass  # param may not exist on first boot
+
   @staticmethod
   def deinit(CP, can_recv, can_send):
     communication_control = bytes([uds.SERVICE_TYPE.COMMUNICATION_CONTROL, 0x80 | uds.CONTROL_TYPE.ENABLE_RX_ENABLE_TX, uds.MESSAGE_TYPE.NORMAL])
