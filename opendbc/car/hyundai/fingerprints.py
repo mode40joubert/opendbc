@@ -1222,6 +1222,12 @@ FW_VERSIONS = {
     (Ecu.fwdRadar, 0x7d0, None): [
       b'\xf1\x00JX1_ SCC FHCUP      1.00 1.01 99110-T6100         ',
     ],
+    (Ecu.eps, 0x7d4, None): [
+      b'\xf1\x00JX1 MDPS AT USA LHD 1.00 1.00 56310-T6100         ',
+    ],
+    (Ecu.abs, 0x7d1, None): [
+      b'\xf1\x00JX1 ESC \x06 104\x19\x08\x01 58910-T6100         ',
+    ],
   },
   CAR.KIA_CARNIVAL_4TH_GEN: {
     (Ecu.fwdCamera, 0x7c4, None): [
